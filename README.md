@@ -19,3 +19,9 @@
 
 v0.1 alpha
 
+## 注意事项？
+
+使用的noise库编译自（我自己写的）：https://github.com/LunaticLegacy/noise。
+
+我自己基于numpy，手搓了一个批量生成函数，这样可避免python层开销。
+
