@@ -17,11 +17,22 @@ import math
 import random
 import os
 
-from typing import List, Any, Dict, Optional
+from typing import List, Dict, Tuple, Any, Optional, TypeAlias
+from typing_extensions import TypedDict
+from dataclasses import dataclass
 
 # 来自arcpy的导入项
 from arcpy import env
 from arcpy.sa import Idw, Spline, ExtractByMask
+
+# 规定基础类型格式。
+@dataclass
+class Line(TypedDict):            
+    geometry: ap.Polyline
+    width: float
+    level: int
+
+Point: TypeAlias = Tuple[Tuple[float, float], float]
 
 class Toolbox(object):
     def __init__(self):
@@ -160,6 +171,26 @@ class GenerateTerrain:
             direction="Input"
         )
 
+        p_terrain_type: ap.Parameter = ap.Parameter(
+            displayName="地形类型",
+            name="terrain_type",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input"
+        )
+        p_terrain_type.filter.type = "ValueList"
+        p_terrain_type.filter.list = ["坡状", "山丘", "山谷"]
+        p_terrain_type.value = "坡状"
+
+        p_reference_feature: ap.Parameter = ap.Parameter(
+            displayName="参考要素（点或线要素）",
+            name="referencing_feature",
+            datatype="DEFeatureClass",
+            parameterType="Optional",
+            direction="Input"
+        )
+        p_reference_feature.enabled = False
+
         p_output: ap.Parameter = ap.Parameter(
             displayName="输出DEM（结果）",
             name="out_dem",
@@ -172,7 +203,8 @@ class GenerateTerrain:
             p_out_ws, p_out_name, p_extent, p_clip_fc,
             p_minz, p_maxz, p_cellsize, p_azimuth,
             p_npts, p_noise, p_method, p_seed, 
-            p_projection, p_output
+            p_projection, p_terrain_type, p_reference_feature, 
+            p_output
         ]
         return params
 
@@ -196,6 +228,15 @@ class GenerateTerrain:
             except Exception:
                 pass
 
+        if parameters[13].value:
+            try:
+                if parameters[13].valueAsText == "山丘" or parameters[13].valueAsText == "山谷":
+                    parameters[14].enabled = True
+                else:
+                    parameters[14].enabled = False
+            except Exception:
+                pass
+
     def updateMessages(self, parameters: List[ap.Parameter]) -> None:
         return
 
@@ -214,8 +255,6 @@ class GenerateTerrain:
         method: str = parameters[10].valueAsText
         seed: Optional[int] = int(parameters[11].valueAsText) if parameters[11].value else None
         projection: ap.SpatialReference = parameters[12].value
-
-        ap.AddMessage(f"投影变量：{projection}")
 
         # Seed RNG
         if seed is not None:
@@ -238,7 +277,7 @@ class GenerateTerrain:
         ymin: float = extent.YMin
         xmax: float = extent.XMax
         ymax: float = extent.YMax
-        ap.AddMessage(f"地形生成范围：{xmin, xmax, ymin, ymax}")
+        ap.AddMessage(f"地形生成范围：x in: {xmin, xmax}, y in: {ymin, ymax}")
 
         width: float = xmax - xmin
         height: float = ymax - ymin
@@ -250,7 +289,7 @@ class GenerateTerrain:
         ux: float = math.cos(theta)
         uy: float = math.sin(theta)
 
-        # 内存点位
+        # 设置点位数据集，并加入点位
         temp_gdb: str = ap.management.CreateFileGDB(env.scratchFolder, f"syntTerrain_{random.randint(1000,9999)}").getOutput(0)
         ap.AddMessage(f"临时GDB: {temp_gdb}")
         env.scratchWorkspace = temp_gdb
@@ -275,11 +314,20 @@ class GenerateTerrain:
                 nt = max(0.0, min(1.0, nt))
 
                 base_z: float = min_z + nt * (max_z - min_z)
-                noise: float = random.gauss(0.0, 1.0) * noise_strength * (max_z - min_z) * 0.15
+                noise: float = random.gauss(0.0, 1.0) * noise_strength * (max_z - min_z) * 0.15 * (cell_size / 1000)
                 z: float = max(min_z, min(max_z, base_z + noise))
                 icur.insertRow(((x, y), z))
 
         ap.AddMessage(f"已生成随机采样点，数量：{n_points}")
+
+        # 保存采样点要素。
+        points_path: str = os.path.join(out_ws, "points_debug")
+        try:
+            ap.management.CopyFeatures(pts_fc, points_path)
+            ap.AddMessage(f"采样点要素已保存至: {points_path}")
+        except Exception as e:
+            ap.AddWarning(f"保存采样点要素失败: {str(e)}")
+
 
         # 设置范围
         env.extent = ap.Extent(xmin, ymin, xmax, ymax)
@@ -297,31 +345,37 @@ class GenerateTerrain:
         else:
             dem_clipped = dem_tmp
 
+        ap.AddMessage("地形生成并剪裁完毕，正在保存。")
+
         # 保存输出
         out_path: str = os.path.join(out_ws, out_name)
-        out_path = out_path.encode("utf-8", errors="ignore").decode("utf-8")
-        try:
-            dem_clipped.save(out_path)
-        except UnicodeDecodeError as e:
-            ap.AddMessage("错误：{e}，可能因为文件已存在导致。")
-        ap.AddMessage(f"输出DEM: {out_path}")
+        out_path_unicode: str = out_path.encode("utf-8", errors="ignore").decode("utf-8")    # 防御
+        dem_clipped.save(out_path_unicode)
+        ap.AddMessage(f"输出DEM: {out_path_unicode}")
 
-        parameters[-1].value = out_path
+        parameters[-1].value = out_path_unicode
         return
-
+    
 
 class GenerateMountain(object):
     """
     生成算法：
     1. 先基于原始基线，生成不等长度的法向量，作为1级基线。然后以此类推生成3级基线。（数字越大，等级越低）
-        - 对非原始基线而言，同级基线不得有交点，且同级基线只能与上级基线之间有1个焦点。
-        - 下级基线的长度一般是上级基线的μ(0.2, 0.03)，遵循正态分布。
-    2. 通过3级基线生成对应的山脉范围，使用缓冲区，以所有的基线为范围（等级越低，缓冲区范围越小），确定山脉范围。
-    3. 以基线作为山脊线，每一点均必须具有头坐标及尾坐标。
-        3.1 先基于所有的基线生成点位，下级基线的点位高程比上级基线更低。
-        3.2 主要基线中，选择位于最中央的节点作为山脉最高点。（可偏移最多3个点的距离）
-
+        1.1 先按照基点密度，在线上生成特定数量的基点。
+        1.2 随后，对每一个基点而言，基点作为原点，按照如下规则拉出射线（并将其截断在下级基线长度中）：
+            - 对非原始基线而言，同级基线不得有交点，且同级基线只能与上级基线之间有1个焦点。
+            - 下级基线的长度一般是上级基线的μ(0.2, 0.03)，遵循正态分布。
+            - 基线可以不必与原始线互相垂直，但必须至少保证在该点上与基线呈15°的夹角。
+            - 基线的远端距离不得长于基线长度。
+            - 最低级基线不再执行拉射线操作。
+    2. 生成对应的山脉范围：
+        2.1 使用缓冲区以所有的基线为范围（等级越低，缓冲区范围越小），确定山脉范围。
+    3. 以基线作为山脊线，对各点位赋值。遵循如下规则：
+        - 更高级基线上基点的高度均值必须整体大于下级基线。
+        - 距山脊线越高，点位高度越高。但点位高度不得高于最近的山脊点。
+    4. 插值。
     """
+
     def __init__(self):
         self.label = "步骤2：生成山脉"
         self.description = "使用线要素规定山脉走向，并根据山脉走向，在步骤1的基础上，生成山脉。"
@@ -388,7 +442,7 @@ class GenerateMountain(object):
             displayName="参考DEM（用于获取分辨率）",
             name="reference_dem",
             datatype="DERasterDataset",
-            parameterType="Required",
+            parameterType="Optional",
             direction="Input"
         )
         p_reference_dem.enabled = False
@@ -415,7 +469,7 @@ class GenerateMountain(object):
 
         # 基线点密度
         p_baseline_point_density = ap.Parameter(
-            displayName="基线点密度（每条基线上生成多少个点）",
+            displayName="基线点密度（在每条基线的泰森多边形区域内附近生成多少个点）",
             name="baseline_point_density",
             datatype="GPLong",
             parameterType="Required",
@@ -517,24 +571,16 @@ class GenerateMountain(object):
 
     def execute(self, parameters: List[ap.Parameter], messages):
         """
-        生成算法：
-        1. 先基于原始基线，生成不等长度的法向量，作为1级基线。然后以此类推生成3级基线。（数字越大，等级越低）
-            - 对非原始基线而言，同级基线不得有交点，且同级基线只能与上级基线之间有1个焦点。
-            - 下级基线的长度一般是上级基线的μ(0.2, 0.03)，遵循正态分布。
-            - 基线可以不必与原始线互相垂直，但必须至少有15°的夹角。
-        2. 生成对应的山脉范围：使用缓冲区以所有的基线为范围（等级越低，缓冲区范围越小），确定山脉范围。
-        3. 以基线作为山脊线，每一点均必须具有头坐标及尾坐标。
-            3.1 先基于所有的基线生成点位，下级基线的点位高程比上级基线更低。
-            3.2 主要基线中，选择位于最中央的节点作为山脉最高点。（可偏移最多3个点的距离）
+        执行算法。
         """
         
         # 解包参数
         out_ws: str = parameters[0].valueAsText
         out_name: str = parameters[1].valueAsText
-        ridge_lines: ap.FeatureSet = parameters[2].value
+        ridge_lines: str = parameters[2].valueAsText
         dem_source: str = parameters[3].valueAsText
         cell_size: float = parameters[4].value
-        reference_dem: float = parameters[5].value
+        reference_dem: str = parameters[5].value
         noise_strength: float = parameters[6].value
         baseline_density: int = parameters[7].value
         baseline_point_density: float = parameters[8].value
@@ -559,178 +605,235 @@ class GenerateMountain(object):
         temp_gdb = ap.management.CreateFileGDB(ap.env.scratchFolder, temp_gdb_name).getOutput(0)
         ap.AddMessage("临时GDB: {}".format(temp_gdb))
         ap.env.scratchWorkspace = temp_gdb
-        
-        try:
-            # 步骤1: 生成基线系统
-            # 读取原始山脊线
-            baselines: List[Dict[str, Any]] = []
-            with ap.da.SearchCursor(ridge_lines, ["SHAPE@", width_field]) as cursor:
-                for row in cursor:
-                    # 处理宽度字段可能为空的情况
-                    width: float = row[1] if row[1] is not None else 100  # 默认宽度100米
-                    baseline: Dict[str, Any] = {
-                        "geometry": row[0],
-                        "width": width,
-                        "level": 0  # 原始基线为0级
-                    }
-                    baselines.append(baseline)
-            
-            ap.AddMessage(f"读取到{len(baselines)}条原始山脊线")
-            
-            # 生成下级基线 (1级到3级)
-            all_baselines: List[List[Dict[str, Any]]] = [baselines[:]]  # 包含所有级别的基线
-            # 基线索引使用operator[]进行。
 
-            # 为每个级别生成下级基线
-            for level in range(1, 4):  # 生成1, 2, 3级基线
-                new_baselines: List[Dict[str, Any]] = []
-                for baseline in all_baselines[-1]:  # 选取all_baselines的最后一个元素。
-                    new_baseline_list: List[Dict[str, Any]] = self._generate_sub_baseline(baseline, baseline_density, level)
+        # 步骤1: 生成基线系统
+        # 读取原始山脊线
+        baselines: List[List[Line]] = []    # 一个用于读取山脊线的程序。
+        basepoints: List[List[Point]] = []
 
-                all_baselines.extend(new_baselines)
-                ap.AddMessage(f"生成{len(new_baselines)}条{level}级基线")
-            
-            # 步骤2: 生成山脉范围
-            # 为不同级别的基线创建缓冲区
-            buffered_baselines = []
-            for baseline in all_baselines:
-                buffer_fc = os.path.join(temp_gdb, f"buffer_{random.randint(1000, 9999)}")
-                # 确保宽度不为None
-                width = baseline["width"] if baseline["width"] is not None else 100
-                # 缓冲区大小随级别递减
-                buffer_distance = width * (0.5 ** baseline["level"])
-                ap.Buffer_analysis(
-                    in_features=baseline["geometry"],
-                    out_feature_class=buffer_fc,
-                    buffer_distance_or_field=f"{buffer_distance} Meters",
-                    dissolve_option="ALL"
+        with ap.da.SearchCursor(ridge_lines, ["SHAPE@", width_field]) as cursor:
+            init_baseline: List[Line] = []
+            for row in cursor:
+                # 处理宽度字段可能为空的情况
+                width: float = row[1] if row[1] is not None else 100  # 默认宽度100米
+                now_baseline: Line = {
+                    "geometry": row[0],
+                    "width": width,
+                    "level": 0  # 原始基线为0级
+                }
+                init_baseline.append(now_baseline)
+            baselines.append(init_baseline)
+
+        ap.AddMessage(f"读取到{len(baselines)}条原始山脊线，正在生成下级基线...")
+
+        # 第一步：开始生成各级基线。
+        for level in range(1, 1+3):
+            # 开始生成基线，每次取最终元素。
+            new_baseline: List[Line] = []
+            new_points: List[List[Point]] = []
+            for line in baselines[-1]:
+                now_lines, init_points = self._generate_sub_baseline(
+                    parent_baseline=line, 
+                    sub_line_num=baseline_density, 
+                    level=level, 
+                    noice_strength=noise_strength
                 )
-                buffered_baselines.append(buffer_fc)
-            
-            # 合并所有缓冲区以确定山脉范围
-            mountain_extent_fc = os.path.join(temp_gdb, "mountain_extent")
-            ap.Merge_management(buffered_baselines, mountain_extent_fc)
-            
-            # 步骤3: 生成点位和高程
-            # 创建点要素类
-            pts_fc = os.path.join(temp_gdb, "mountain_points")
-            ap.CreateFeatureclass_management(temp_gdb, "mountain_points", "POINT", spatial_reference=sr)
-            ap.AddField_management(pts_fc, "z", "DOUBLE")
-            
-            # 为所有基线生成点位
-            with ap.da.InsertCursor(pts_fc, ["SHAPE@XY", "z"]) as cursor:
-                for baseline in all_baselines:
-                    # 在基线上按点密度生成点
-                    points = self._generate_points_on_baseline(
-                        baseline, 
-                        baseline_point_density, 
-                        noise_strength
-                    )
-                    for point in points:
-                        cursor.insertRow(point)
-            
-            ap.AddMessage(f"已生成{int(ap.GetCount_management(pts_fc).getOutput(0))}个点。")
+                new_baseline.extend(now_lines),
+                new_points.extend(init_points)
+            # 加入点。
+            baselines.append(new_baseline)
+            basepoints.append(new_points)
 
-            # 设置范围和像元大小
-            ap.env.extent = extent
-            ap.env.cellSize = cell_size
+            ap.AddMessage(f"{level}级基线生成完毕，共计生成{len(new_baseline)}条，及{len(new_points)}个点。")
+
+        # 第二步：生成山脉范围（缓冲区）
+        buffers: List[str] = []  # 存储各级缓冲结果的路径
+
+        ap.AddMessage("正在生成山脉范围...")
+
+        for level, lines in enumerate(baselines):
+            if not lines:
+                continue
+
+            # 生成该级别的要素类
+            fc_name: str = f"baseline_level{level}_{random.randint(100,999)}"
+            fc_path: str = os.path.join(temp_gdb, fc_name)
+            ap.CreateFeatureclass_management(
+                out_path=temp_gdb,
+                out_name=fc_name,
+                geometry_type="POLYLINE",
+                spatial_reference=sr
+            )
+            ap.AddField_management(fc_path, "WIDTH", "DOUBLE")
+
+            # 批量写入该级别的基线
+            with ap.da.InsertCursor(fc_path, ["SHAPE@", "WIDTH"]) as cursor:
+                for line in lines:
+                    width: float = line["width"] * (1 - level * 0.1)  # 级别越低，缓冲区越窄
+                    cursor.insertRow([line["geometry"], width])
+
+            # 一次性生成该级别的缓冲区
+            buf_fc: str = os.path.join(temp_gdb, f"buffer_level{level}")
+            ap.Buffer_analysis(fc_path, buf_fc, "WIDTH")
+            buffers.append(buf_fc)
+
+            ap.AddMessage(f"{level}级山脉缓冲区生成完毕，共 {len(lines)} 条基线。输出到：{buf_fc}")
+
+        # 合并所有级别缓冲区
+        mountain_area: str = os.path.join(temp_gdb, "mountain_area")
+        merged_fc: str = os.path.join(temp_gdb, "all_buffers")
+        ap.Merge_management(buffers, merged_fc)
+        ap.Dissolve_management(merged_fc, mountain_area)
+
+        ap.AddMessage(f"所有缓冲区合并完成，山脉范围输出：{mountain_area}")
+
+        # 第三步：山脊点赋值，并准备进行插值。
+        # 收集所有点
+        ap.AddMessage("正在为山脊点赋值...")
+        all_points = []
+        for level, pts_group in enumerate(basepoints):
+            for pt in pts_group:
+                all_points.append([pt[0][0], pt[0][1], pt[1]])
+
+        # 存储为点要素类
+        sr = desc.spatialReference
+        point_fc = os.path.join(temp_gdb, "ridge_points")
+        ap.CreateFeatureclass_management(temp_gdb, "ridge_points", "POINT", spatial_reference=sr)
+        ap.AddField_management(point_fc, "Z", "DOUBLE")
+
+        with ap.da.InsertCursor(point_fc, ["SHAPE@XY", "Z"]) as cursor:
+            for x, y, z in all_points:
+                cursor.insertRow(((x, y), z))
+
+        # 插值
+        ap.AddMessage("插值中...")
+        dem_final = Spline(point_fc, "Z", cell_size)
+
+        # 保存 DEM
+        out_dem: str = os.path.join(out_ws, out_name)
+        dem_final.save(out_dem)
+        ap.AddMessage(f"DEM已生成在: {out_dem}")
             
-            # 插值生成DEM
-            ap.AddMessage(f"正在通过IDW法生成山区DEM...请在山区DEM生成结束后，将该DEM和背景DEM间相加（如果你有）。")
-            dem_tmp = ap.sa.Idw(pts_fc, "z", cell_size)
-            
-            # 保存输出
-            out_path = os.path.join(out_ws, out_name)
-            out_path = out_path.encode('utf-8', errors='ignore').decode('utf-8')
-            dem_tmp.save(out_path)
-            ap.AddMessage(f"输出DEM: {out_path}")
-            
-            # 设置输出位置
-            parameters[-1].value = out_path
-            
-        except Exception as e:
-            ap.AddError(f"执行过程中出现错误: {str(e)}")
-            raise
-        
+        parameters[-1] = out_dem
+
         return
     
     def _generate_sub_baseline(
             self, 
-            parent_baseline: Dict[str, Any], 
+            parent_baseline: Line, 
             sub_line_num: int,
-            level: int
-        ) -> List[Dict[str, Any]]:
+            level: int,
+            noice_strength: float
+        ) -> Tuple[List[Line], List[Point]]:
         """
         生成下级基线。规则：
-        1. 在上级基线上生成点。
-        2. 基于该点，生成长度随机的线。
+        - 对非原始基线而言，同级基线不得有交点，且同级基线只能与上级基线之间有1个焦点。
+        - 下级基线的长度一般是上级基线的μ(0.2, 0.03)，遵循正态分布。
+        - 基线可以不必与原始线互相垂直，但必须至少保证在该点上与基线呈15°的夹角。
+        - 基线的远端距离不得长于基线长度。
+        - 最低级基线不再执行拉射线操作。
 
         Args:
-            parent_baseline (Dict[str, Any]): 用于生成本级基线的上级基线。
+            parent_baseline (Line): 用于生成本级基线的上级基线。
             sub_line_num (int): 生成的子基线数量。
             level (int): 基线等级。
         
         Returns:
-            (List[Dict[str, Any]]): 新的基线列表。
+            (Tuple[List[Line], List[Point]]): 新的基线列表，和对应的基点列表。
         """
-        try:
-            # 获取基线几何
-            geom: str = parent_baseline["geometry"]
-            width: float = parent_baseline["width"] if parent_baseline["width"] is not None else 100
+        geom = parent_baseline["geometry"]
+        width = parent_baseline["width"] if parent_baseline["width"] is not None else 100
 
-            for _ in range(0, sub_line_num):
-                # 生成下级基线长度（遵循正态分布）
-                sub_length_ratio: float = random.gauss(0.3, 0.075)
-                # 然后，生成对应的基线内容。
-                sub_baseline = {
-                    "geometry": geom,  # 实际这里应创建一个新的几何要素。
-                    "width": width * sub_length_ratio,
-                    "level": level
-                }
-            
-            return sub_baseline
-        except Exception:
-            return None
-    
-    def _generate_points_on_baseline(self, baseline, point_density, noise_strength):
+        # 在基线上生成基点
+        points: List[Point] = self._generate_points_on_baseline(
+            parent_baseline, sub_line_num, noice_strength
+        )
+        lines: List[Line] = []
+
+        # 遍历基点，生成子线
+        for pt, z in points:
+            x0, y0 = pt
+
+            # 基线方向（取线段首尾点方向）
+            start, end = geom.firstPoint, geom.lastPoint
+            dx, dy = end.X - start.X, end.Y - start.Y
+            base_angle = math.atan2(dy, dx)
+
+            # 随机角度偏移，必须保证与原始线夹角 >= 15°
+            offset_angle = math.radians(random.uniform(30, 150))
+            if random.random() < 0.5:
+                offset_angle = -offset_angle
+            new_angle = base_angle + offset_angle
+
+            # 下级基线长度（高斯分布，限制不超过父线长度）
+            parent_length = geom.length
+            sub_length = min(
+                parent_length, 
+                abs(random.gauss(0.2, 0.03)) * parent_length
+            )
+
+            # 计算终点
+            x1 = x0 + sub_length * math.cos(new_angle)
+            y1 = y0 + sub_length * math.sin(new_angle)
+
+            # 构建新的 polyline
+            array = ap.Array([ap.Point(x0, y0), ap.Point(x1, y1)])
+            new_geom = ap.Polyline(array, geom.spatialReference)
+
+            sub_baseline: Line = {
+                "geometry": new_geom,
+                "width": width * (sub_length / parent_length),
+                "level": level
+            }
+            lines.append(sub_baseline)
+
+        return (lines, points)
+
+    def _generate_points_on_baseline(
+            self, 
+            baseline: Line, 
+            point_density: float, 
+            noise_strength: float
+        ) -> List[Point]:
         """
-        在基线上生成点位
+        在基线上生成点位。
+        Args:
+            baseline (Line): 目标基线。
+            point_density (float): 该基线上生成的点数量。
+            noise_strength (float): 噪音强度。
         """
-        points = []
-        try:
-            geom = baseline["geometry"]
-            level = baseline["level"]
+        points: List[Point] = []
+
+        geom = baseline["geometry"]
+        level = baseline["level"]
+        
+        # 根据基线级别确定点的数量
+        num_points: int = point_density * (4 - level)  # 级别越高点越少 
+        
+        # 获取基线的起点和终点
+        first_point = geom.firstPoint
+        last_point = geom.lastPoint
+        
+        # 在基线上均匀分布点
+        for i in range(int(num_points)):
+            # 计算点的位置比例
+            ratio = i / (num_points - 1) if num_points > 1 else 0.5
             
-            # 根据基线级别确定点的数量
-            num_points = point_density * (4 - level)  # 级别越高点越少
+            # 线性插值计算点坐标
+            x = first_point.X + (last_point.X - first_point.X) * ratio
+            y = first_point.Y + (last_point.Y - first_point.Y) * ratio
             
-            # 获取基线的起点和终点
-            first_point = geom.firstPoint
-            last_point = geom.lastPoint
+            # 基础高程（简化模型：起点高程到终点高程的线性变化）
+            # 实际应用中应该从字段中读取起点和终点高程
+            base_z = 1000 - (level * 200)  # 级别越高高程越低
             
-            # 在基线上均匀分布点
-            for i in range(int(num_points)):
-                # 计算点的位置比例
-                ratio = i / (num_points - 1) if num_points > 1 else 0.5
-                
-                # 线性插值计算点坐标
-                x = first_point.X + (last_point.X - first_point.X) * ratio
-                y = first_point.Y + (last_point.Y - first_point.Y) * ratio
-                
-                # 基础高程（简化模型：起点高程到终点高程的线性变化）
-                # 实际应用中应该从字段中读取起点和终点高程
-                base_z = 1000 - (level * 200)  # 级别越高高程越低
-                
-                # 添加噪声
-                if noise_strength:
-                    noise = random.gauss(0, noise_strength * 100)
-                    z = base_z + noise
-                else:
-                    z = base_z
-                
-                points.append(((x, y), z))
-                
-        except Exception as e:
-            ap.AddWarning(f"生成基线点时出错: {str(e)}")
+            # 添加噪声
+            if noise_strength:
+                noise = random.gauss(0, noise_strength * 100)
+                z = base_z + noise
+            else:
+                z = base_z
+            
+            points.append(((x, y), z))
         
         return points
